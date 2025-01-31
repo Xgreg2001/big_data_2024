@@ -1,85 +1,93 @@
 import random
 import math
-import hashlib
+import numpy as np
 import matplotlib.pyplot as plt
 
 
-class LogLog:
-    def __init__(self, num_buckets=128):
-        self.num_buckets = num_buckets
-        self.buckets = [0] * num_buckets
-        self.alpha = 0.39701
-        self.bucket_bits = int(math.log2(num_buckets))
-
-    def _hash(self, value):
-        h = hashlib.sha1(str(value).encode('utf-8')).digest()
-        return int.from_bytes(h[:8], 'big')
-
-    def add(self, value):
-        h = self._hash(value)
-        bucket_index = h >> (64 - self.bucket_bits)
-        w = (h << self.bucket_bits) & ((1 << 64) - 1)
-        rho = 1
-        while (w & (1 << (64 - 1))) == 0 and rho <= 64:
-            w <<= 1
-            rho += 1
-        self.buckets[bucket_index] = max(self.buckets[bucket_index], rho)
-
-    def estimate(self):
-        avg = sum(self.buckets) / self.num_buckets
-        return self.alpha * self.num_buckets * (2 ** avg)
-
-
 class HyperLogLog:
-    def __init__(self, num_buckets=128):
-        self.m = num_buckets
-        self.buckets = [0] * self.m
-        self.p = int(math.log2(self.m))
-        self.alpha = self._get_alpha(self.m)
+    def __init__(self, registers=1024):
+        if not (registers & (registers - 1) == 0):
+            raise ValueError("Number of registers must be a power of 2")
 
-    def _get_alpha(self, m):
-        if m == 16:
-            return 0.673
-        elif m == 32:
-            return 0.697
-        elif m == 64:
-            return 0.709
-        else:
-            return 0.7213 / (1 + 1.079/m)
+        self.registers = registers
+        self.register_bits = int(math.log2(registers))
+        self.registers_array = [0] * registers
 
-    def _hash(self, value):
-        h = hashlib.sha1(str(value).encode('utf-8')).digest()
-        return int.from_bytes(h[:8], 'big')
+    def _hash(self, item):
+        return hash(str(item))
 
-    def add(self, value):
-        h = self._hash(value)
-        bucket_index = h >> (64 - self.p)
-        w = (h << self.p) & ((1 << 64) - 1)
-        rho = 1
-        while (w & (1 << (64 - 1))) == 0 and rho <= 64:
-            w <<= 1
-            rho += 1
-        self.buckets[bucket_index] = max(self.buckets[bucket_index], rho)
+    def _get_leading_zeros(self, hash_value):
+        hash_value = abs(hash_value) & 0xFFFFFFFF
+        if hash_value == 0:
+            return 32
+
+        return (hash_value).bit_length() - (hash_value).bit_length()
+
+    def add(self, item):
+        hash_value = self._hash(item)
+        register_index = hash_value & ((1 << self.register_bits) - 1)
+        leading_zeros = self._get_leading_zeros(hash_value >> self.register_bits) + 1
+        self.registers_array[register_index] = max(
+            self.registers_array[register_index], leading_zeros
+        )
 
     def estimate(self):
-        indicator_sum = 0
-        for val in self.buckets:
-            indicator_sum += 2.0 ** (-val)
-        raw_estimate = self.alpha * (self.m ** 2) / indicator_sum
-        if raw_estimate <= (5.0 * self.m / 2.0):
-            v = self.buckets.count(0)
-            if v != 0:
-                raw_estimate = self.m * math.log(self.m / v)
-        if raw_estimate > (1 << 32) / 30.0:
-            raw_estimate = - \
-                ((1 << 32) * math.log(1 - (raw_estimate / (1 << 32))))
+        if self.registers == 16:
+            alpha = 0.673
+        elif self.registers == 32:
+            alpha = 0.697
+        elif self.registers == 64:
+            alpha = 0.709
+        else:
+            alpha = 0.7213 / (1 + 1.079 / self.registers)
+
+        raw_estimate = (
+            alpha
+            * (self.registers**2)
+            / sum(2 ** (-reg_value) for reg_value in self.registers_array)
+        )
+
+        if raw_estimate <= 2.5 * self.registers:
+            empty_registers = self.registers_array.count(0)
+            if empty_registers > 0:
+                return self.registers * math.log(self.registers / empty_registers)
+
         return raw_estimate
+
+
+class LogLog:
+    def __init__(self, registers=1024):
+        self.registers = registers
+        self.register_bits = int(math.log2(registers))
+        self.registers_array = [0] * registers
+
+    def _hash(self, item):
+        return hash(str(item))
+
+    def _get_leading_zeros(self, hash_value):
+        hash_value = abs(hash_value) & 0xFFFFFFFF
+        if hash_value == 0:
+            return 32
+
+        return (hash_value).bit_length() - (hash_value).bit_length()
+
+    def add(self, item):
+        hash_value = self._hash(item)
+        register_index = hash_value % self.registers
+        leading_zeros = self._get_leading_zeros(hash_value) + 1
+        self.registers_array[register_index] = max(
+            self.registers_array[register_index], leading_zeros
+        )
+
+    def estimate(self):
+        mean_leading_zeros = np.mean(self.registers_array)
+        return 2**mean_leading_zeros * self.registers / 0.77351
 
 
 def single_run_errors(n, k):
     elements = random.sample(range(n * 100), n)
-    ll = LogLog(num_buckets=k)
-    hll = HyperLogLog(num_buckets=k)
+    ll = LogLog(registers=k)
+    hll = HyperLogLog(registers=k)
     for e in elements:
         ll.add(e)
         hll.add(e)
@@ -102,9 +110,17 @@ def main():
     for k in bucket_sizes:
         center = int(k * math.log(k))
         n_vals = [
-            100, 500, 1000, 2000, 3000, 4000, 5000, 10000, 20000, 30000, 40000,
-            50000, 100000, max(1, center // 2), center, center * 2,
-            int(center * 1.5), max(1, int(center * 0.75)),
+            int(max(1, center * 0.1)),
+            int(max(1, center * 0.15)),
+            int(max(1, center * 0.25)),
+            int(max(1, center * 0.45)),
+            int(max(1, center * 0.5)),
+            int(max(1, center * 0.75)),
+            center,
+            int(center * 1.25),
+            int(center * 1.5),
+            int(center * 1.75),
+            center * 2,
         ]
         n_vals = sorted(set(n_vals))
         ll_errs = []
@@ -113,21 +129,18 @@ def main():
             e_ll, e_hll = average_run_errors(n, k, runs=runs)
             ll_errs.append(e_ll)
             hll_errs.append(e_hll)
-        plt.figure()
-        plt.plot(n_vals, ll_errs, marker='o', label='LogLog')
-        plt.plot(n_vals, hll_errs, marker='s', label='HyperLogLog')
-        plt.axvline(k * math.log(k), color='r',
-                    linestyle='--', label='k ln(k)')
-        plt.xscale('log')
-        plt.yscale('log')
-        plt.title(f'k={k}')
-        plt.xlabel('n')
-        plt.ylabel('Relative Error')
+        plt.figure(figsize=(16, 9))
+        plt.plot(n_vals, ll_errs, marker="o", label="LogLog")
+        plt.plot(n_vals, hll_errs, marker="s", label="HyperLogLog")
+        plt.axvline(center, color="r", linestyle="--", label="k ln(k)")
+        plt.title(f"k={k}")
+        plt.xlabel("n")
+        plt.ylabel("Relative Error")
         plt.legend()
-        plt.grid(True, which='both', linestyle='--', alpha=0.7)
-        plt.savefig(f'plot_k_{k}.pdf')
+        plt.grid(True, which="both", linestyle="--", alpha=0.7)
+        plt.savefig(f"plot_k_{k}.pdf")
         plt.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
